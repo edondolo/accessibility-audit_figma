@@ -1,61 +1,64 @@
-from flask import Flask, request, jsonify
-import openai
+
 import base64
+import io
+from flask import Flask, request, jsonify
+from PIL import Image
+import numpy as np
+import requests
+import openai
 import os
 
 app = Flask(__name__)
-
-# Load OpenAI API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Accessibility Audit API is running."
+def calculate_luminance(rgb):
+    def channel_lum(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb
+    return 0.2126 * channel_lum(r) + 0.7152 * channel_lum(g) + 0.0722 * channel_lum(b)
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    try:
-        data = request.get_json()
-        image_data = data.get("image_base64", "")
+def contrast_ratio(color1, color2):
+    lum1 = calculate_luminance(color1)
+    lum2 = calculate_luminance(color2)
+    lighter = max(lum1, lum2)
+    darker = min(lum1, lum2)
+    return round((lighter + 0.05) / (darker + 0.05), 2)
 
-        if not image_data:
-            return jsonify({"error": "Missing image_base64"}), 400
+@app.route("/audit", methods=["POST"])
+def audit():
+    data = request.json
+    image_data = data.get("image_base64")
 
-        # Prepare base64 image for GPT-4 Vision
-        image = {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/png;base64,{image_data}",
-                "detail": "high"
-            },
-        }
+    if not image_data:
+        return jsonify({"error": "No image provided"}), 400
 
-        # Accessibility-focused prompt
-        prompt = (
-            "You are a senior accessibility expert. Analyze this UI screenshot for accessibility issues using WCAG 2.2 guidelines. "
-            "Return a list of grouped findings with: issue type (e.g., color contrast, target size), severity, layer name (if mentioned), and fix recommendation. "
-            "Use a JSON format structured like: [{layer, issue, wcag, details, fix}]."
-        )
+    # Decode image
+    image_bytes = base64.b64decode(image_data.split(",")[-1])
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_np = np.array(image)
 
-        # Send request to GPT-4 Vision
-        response = openai.ChatCompletion.create(
-            model="gpt-4-vision-preview",
-            messages=[
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    image
-                ]}
-            ],
-            max_tokens=1000
-        )
+    # Get dominant foreground and background colors (simplified)
+    center_text_pixel = img_np[img_np.shape[0]//2, img_np.shape[1]//2]
+    corner_background_pixel = img_np[10, 10]
 
-        raw = response.choices[0].message.content
-        return jsonify({"raw": raw})
+    contrast = contrast_ratio(center_text_pixel, corner_background_pixel)
+    passes = contrast >= 4.5
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    findings = [{
+        "category": "Color Contrast",
+        "layer": "Central text area",
+        "issue": "Poor color contrast" if not passes else "Passes WCAG AA",
+        "contrast_ratio": contrast,
+        "threshold": 4.5,
+        "suggestion": "Increase text/background contrast" if not passes else "None"
+    }]
 
-# 🟢 Required for Render to bind the correct port
+    return jsonify({"findings": findings})
+
+@app.route("/")
+def index():
+    return "Accessibility audit service is running."
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True, host="0.0.0.0")

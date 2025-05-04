@@ -1,2 +1,4 @@
 flask
 openai
+Pillow
+numpy
